@@ -1,2 +1,17 @@
 .idea
 cmake-build-debug
+
+.vs
+x64
+packages
+imgs
+*.sln
+*.vcxproj
+*.vcxproj.user
+*.vcxproj.filters
+*.config
+*.sh
+*.bat
+
+*.ipynb
+results/combined_results

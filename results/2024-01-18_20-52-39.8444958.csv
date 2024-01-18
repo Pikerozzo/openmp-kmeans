@@ -1,0 +1,2 @@
+init_exec_time,kmeans_exec_time,points,centroids,threads
+10600,1368040,10000,5,4
