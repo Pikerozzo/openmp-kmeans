@@ -14,4 +14,6 @@ imgs
 *.bat
 
 *.ipynb
-results/combined_results
+results/
+solution
+*.py

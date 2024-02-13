@@ -4,6 +4,12 @@
 
 Centroids::Centroids() = default;
 
+Centroids::Centroids(int size) : totalCentroids(size) {
+	posX = std::vector<double>(size);
+    posY = std::vector<double>(size);
+    ids = std::vector<int>(size);
+}
+
 Centroids::Centroids(const Centroids& c) {
     this->posX = c.posX;
     this->posY = c.posY;

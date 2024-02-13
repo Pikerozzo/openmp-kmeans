@@ -2,7 +2,6 @@
 #include <iostream>
 #include <fstream>
 #include <algorithm>
-#include <stdatomic.h>
 #include <numeric>
 #include <stdexcept>
 #include "omp.h"
@@ -12,66 +11,193 @@
 
 using namespace std;
 
-Kmeans::Kmeans(shared_ptr<Points> p, shared_ptr<Centroids> c, double xCoordMax, double yCoordMax, int totalPoints, int totalCentroids,
-	int maxIterations, bool stopAtMaxIterations, double centroidThreshold, int seed, int kmeansIterations) :
-	p{ p }, c{ c }, xCoordMax{ xCoordMax }, yCoordMax{ yCoordMax }, totalPoints{ totalPoints },
-	totalCentroids{ totalCentroids }, maxIterations{ maxIterations }, stopAtMaxIterations{ stopAtMaxIterations },
-	centroidThreshold{ centroidThreshold }, seed{ seed }, kmeansIterations{ kmeansIterations } {
+Kmeans::Kmeans(shared_ptr<Points> p, shared_ptr<Centroids> c, double xCoordMax, double yCoordMax, int totalPoints, int totalCentroids, int maxIterations, bool stopAtMaxIterations, double centroidThreshold, int seed, int kmeansExecutions) :
+	p{ p }, c{ c }, xCoordMax{ xCoordMax }, yCoordMax{ yCoordMax }, totalPoints{ totalPoints }, totalCentroids{ totalCentroids }, maxIterations{ maxIterations }, stopAtMaxIterations{ stopAtMaxIterations },
+	centroidThreshold{ centroidThreshold }, seed{ seed }, kmeansExecutions{ kmeansExecutions } {
 }
 
 Kmeans::~Kmeans() = default;
 
-void Kmeans::run(int numThreads) {
+
+void Kmeans::runParallel(int numThreads) {
 
 	// initialize current centroids and points
-	Centroids currCentroids{};
-	Points currPoints{ *p };
+	Centroids centroids{ totalCentroids };
+	Points points = *p;
 
-	// vector of point ids
-	vector<int> indices(totalPoints);
-	iota(indices.begin(), indices.end(), 0);
+	// vector of kmeans solutions
+	vector<Solution> solutions(kmeansExecutions);
 
-	// vector of solutions, one for each thread
-	vector<Solution> solutions(numThreads);
+	// variables for convergence check
+	bool notConverged = true;
+	int it = 0;
+	int totCentroidsMoved = 0;
+	double currSse = 0.0;
+	double centroidThresholdSquared = centroidThreshold * centroidThreshold;
 
-	// start of parallel section
-#pragma omp parallel firstprivate(currPoints, currCentroids, indices) shared(solutions) default(none) num_threads(numThreads)
+	// vectors to store centroid positions and counts for each thread
+	vector<double> centroidPositionsX(totalCentroids * numThreads);
+	vector<double> centroidPositionsY(totalCentroids * numThreads);
+	vector<int> centroidCounts(totalCentroids * numThreads);
+
+	// initialize centroids with random points	
+	mt19937_64 gen(seed);
+	vector<int> indices{ points.ids };
+	vector<int> executionInitCentroids(kmeansExecutions * totalCentroids);
+	for (int run = 0; run < kmeansExecutions; ++run)
 	{
-		// create thread-custom random number generator
-		int threadId = omp_get_thread_num();
-		mt19937_64 gen(threadId + seed);
+		shuffle(indices.begin(), indices.end(), gen);
+		for (int i = 0; i < totalCentroids; i++) {
+			executionInitCentroids[run * totalCentroids + i] = indices[i];
+		}
+	}
+	
+	// start of parallel section
+#pragma omp parallel shared(centroids, points, solutions, executionInitCentroids, notConverged, it, currSse, totCentroidsMoved, centroidPositionsX, centroidPositionsY, centroidCounts) default(none) num_threads(numThreads)
+	{
+		int threadID = omp_get_thread_num();
 
-		// initialize thread best solution
-		solutions[threadId] = Solution{};
+		double pointX, pointY;
+		int closestCentroidId;
+		double closestCentroidDist;
+		double deltaX, deltaY;
+		double distance;
+		bool assignToCentroid;
 
-		// parallel for loop, each thread runs a "macro k-means iteration"
+		int index;
+		double x, y, count;
+		double newX, newY;
+
+		int centroidId;
+
+
+		// run kmeans for each set of initial centroids
+		for (int run = 0; run < kmeansExecutions; ++run)
+		{
+			// reset convergence variables for current run
+#pragma omp single nowait
+			{
+				totCentroidsMoved = 0;
+				currSse = 0;
+				notConverged = true;
+				it = 0;
+			}
+
+			// set initial centroids for current run 
 #pragma omp for
-		for (int run = 0; run < kmeansIterations; ++run) {
-
-			// initialize iteration centroids with random points
-			currCentroids.clear();
-			shuffle(indices.begin(), indices.end(), gen);
-			for (int i = 0; i < totalCentroids; i++) {
-				currCentroids.addCentroid(currPoints.posX[indices[i]], currPoints.posY[indices[i]]);
+			for (int i = 0; i < totalCentroids; i++)
+			{
+				index = executionInitCentroids[run * totalCentroids + i];
+				centroids.posX[i] = points.posX[index];
+				centroids.posY[i] = points.posY[index];
+				centroids.ids[i] = i;
 			}
 
-			// run kmeans on the current initial centroids
-			runKmeans(currCentroids, currPoints);
+			// kmeans run start
+			while (notConverged)
+			{
+				// assign points to closest centroid
+#pragma omp for
+				for (int i = 0; i < totalPoints; i++)
+				{
+					pointX = points.posX[i];
+					pointY = points.posY[i];
 
-			// get SSE of current solution
-			double currentSSE = calcSSE(currCentroids, currPoints);
+					closestCentroidId = 0;
+					closestCentroidDist = -1;
 
-			// update best solution found by the current thread 
-			Solution threadBestSolution = solutions[threadId];
-			if (currentSSE < threadBestSolution.sse) {
-				solutions[threadId].sse = currentSSE;
-				solutions[threadId].centroids = currCentroids;
-				solutions[threadId].clusterIds = currPoints.centroidIds;
+					// find closest centroid to point
+					for (int j = 0; j < totalCentroids; j++)
+					{
+						deltaX = centroids.posX[j] - pointX;
+						deltaY = centroids.posY[j] - pointY;
+						distance = deltaX * deltaX + deltaY * deltaY;
+						assignToCentroid = distance < closestCentroidDist || closestCentroidDist < 0;
+
+						// update closest centroid if distance is smaller
+						if (assignToCentroid) {
+							closestCentroidDist = distance;
+							closestCentroidId = centroids.ids[j];
+
+							points.centroidIds[i] = closestCentroidId;
+						}
+					}
+
+					// sum the position of current point associated to its centroid, for each thread
+					centroidPositionsX[closestCentroidId + totalCentroids * threadID] += pointX;
+					centroidPositionsY[closestCentroidId + totalCentroids * threadID] += pointY;
+					centroidCounts[closestCentroidId + totalCentroids * threadID]++;
+				}
+
+				// update centroid positions, reduction on total moved centroids
+#pragma omp for reduction(+:totCentroidsMoved)
+				for (int i = 0; i < totalCentroids; i++)
+				{
+					x = 0;
+					y = 0;
+					count = 0;
+					// sum the coordinates of points associated to a centroid, for each thread
+					for (int j = 0; j < numThreads; j++)
+					{
+						index = j * totalCentroids + i;
+						x += centroidPositionsX[index];
+						y += centroidPositionsY[index];
+						count += centroidCounts[index];
+					}
+
+					// update centroid position if there are points associated to it
+					if (count > 0) {
+						newX = x / count;
+						newY = y / count;
+
+						deltaX = newX - centroids.posX[i];
+						deltaY = newY - centroids.posY[i];
+						distance = deltaX * deltaX + deltaY * deltaY;
+						
+						if (distance > centroidThresholdSquared) {
+							centroids.posX[i] = newX;
+							centroids.posY[i] = newY;
+
+							totCentroidsMoved++;
+						}
+					}
+				}
+
+				// find SSE of current solution
+#pragma omp for reduction(+:currSse)
+				for (int i = 0; i < totalPoints; i++)
+				{
+					centroidId = points.centroidIds[i];
+					deltaX = centroids.posX[centroidId] - points.posX[i];
+					deltaY = centroids.posY[centroidId] - points.posY[i];
+					currSse += sqrt(deltaX * deltaX + deltaY * deltaY);
+				}
+
+				// check stop conditions: no centroids moved or max iterations reached
+#pragma omp single
+				{
+					// if no centroids moved or max iterations reached, save solution
+					if (totCentroidsMoved == 0 || (stopAtMaxIterations && it == maxIterations)) {
+						solutions[run] = Solution{ currSse, centroids, points.centroidIds };
+						notConverged = false;
+					}
+
+					// update iteration counter, reset solution results and helper variables
+					totCentroidsMoved = 0;
+					currSse = 0;
+					it++;
+
+					std::fill(centroidPositionsX.begin(), centroidPositionsX.end(), 0);
+					std::fill(centroidPositionsY.begin(), centroidPositionsY.end(), 0);
+					std::fill(centroidCounts.begin(), centroidCounts.end(), 0);
+				}
 			}
+			// kmeans run end
+
+#pragma omp barrier
 		}
 	}
 	// end of parallel section
-
 
 	// find best solution
 	auto bestSolution = min_element(solutions.begin(), solutions.end(), [](const Solution& sol1, const Solution& sol2) {
@@ -83,98 +209,155 @@ void Kmeans::run(int numThreads) {
 }
 
 
-void Kmeans::runKmeans(Centroids& centroids, Points& points) const {
+void Kmeans::runSequential() {
 
+	// initialize current centroids and points
+	Centroids centroids{ totalCentroids };
+	Points points = *p;
+
+	// vector of kmeans solutions
+	vector<Solution> solutions(kmeansExecutions);
+
+	// vector of point ids for centroids initialization
+	mt19937_64 gen(seed);
+	vector<int> indices{ points.ids };
+	vector<int> executionInitCentroids(kmeansExecutions * totalCentroids);
+	
 	// variables for convergence check
-	int it = 0;
-	bool centroidsMoved = false;
-	double centroidThresholdSquared = centroidThreshold * centroidThreshold;
 	bool notConverged = true;
+	int it = 0;
+	int totCentroidsMoved = 0;
+	double currSse = 0;
+	double centroidThresholdSquared = centroidThreshold * centroidThreshold;
 
-	// run kmeans until convergence or max iterations reached
-	while (true) {
-		centroidsMoved = false;
+	vector<double> centroidPositionsX(totalCentroids);
+	vector<double> centroidPositionsY(totalCentroids);
+	vector<int> centroidCounts(totalCentroids);
 
-		// assign points to closest centroid
-		for (int i = 0; i < points.totalPoints; i++) {
-			double p_x = points.posX[i];
-			double p_y = points.posY[i];
 
-			int closest_c_id = points.centroidIds[i];
-			double closest_c_dist = -1;
-			if (closest_c_id != -1)
+	double pointX, pointY;
+	int closestCentroidId;
+	double closestCentroidDist;
+	double deltaX, deltaY;
+	double distance;
+	bool assignToCentroid;
+
+	int index;
+	double newX, newY;
+
+	int centroidId;
+
+
+	// run kmeans for each set of initial centroids
+	for (int run = 0; run < kmeansExecutions; ++run)
+	{
+		totCentroidsMoved = 0;
+		currSse = 0;
+		notConverged = true;
+		it = 0;
+
+		// set initial centroids for current run		
+		shuffle(indices.begin(), indices.end(), gen);
+		for (int i = 0; i < totalCentroids; i++)
+		{
+			index = indices[i];
+			centroids.posX[i] = points.posX[index];
+			centroids.posY[i] = points.posY[index];
+			centroids.ids[i] = i;
+		}
+
+		// kmeans run start
+		while (notConverged)
+		{
+			// assign points to closest centroid
+			for (int i = 0; i < totalPoints; i++)
 			{
-				closest_c_dist = sqrt(pow(centroids.posX[closest_c_id] - p_x, 2) + pow(centroids.posY[closest_c_id] - p_y, 2));
+				pointX = points.posX[i];
+				pointY = points.posY[i];
+
+				closestCentroidId = points.centroidIds[i];
+				closestCentroidDist = -1;
+
+				// find closest centroid to point
+				distance = 0;
+				for (int j = 0; j < totalCentroids; j++)
+				{
+					if (j == closestCentroidId)
+						continue;
+
+					deltaX = centroids.posX[j] - pointX;
+					deltaY = centroids.posY[j] - pointY;
+					distance = deltaX * deltaX + deltaY * deltaY;
+					assignToCentroid = distance < closestCentroidDist || closestCentroidDist < 0;
+
+					// update closest centroid if distance is smaller
+					if (assignToCentroid) {
+						closestCentroidDist = distance;
+						closestCentroidId = centroids.ids[j];
+
+						points.centroidIds[i] = closestCentroidId;
+					}
+				}
+
+				centroidPositionsX[closestCentroidId] += pointX;
+				centroidPositionsY[closestCentroidId] += pointY;
+				centroidCounts[closestCentroidId]++;
 			}
 
+			// update centroid positions
+			for (int i = 0; i < totalCentroids; i++)
+			{
+				// update centroid position if there are points associated to it
+				if (centroidCounts[i] > 0) {
+					newX = centroidPositionsX[i] / centroidCounts[i];
+					newY = centroidPositionsY[i] / centroidCounts[i];
 
-			// find closest centroid to point
-			double distance = 0;
-			for (int j = 0; j < centroids.totalCentroids; j++) {
+					deltaX = newX - centroids.posX[i];
+					deltaY = newY - centroids.posY[i];
+					distance = deltaX * deltaX + deltaY * deltaY;
+					
+					if (distance > centroidThresholdSquared) {
+						centroids.posX[i] = newX;
+						centroids.posY[i] = newY;
 
-				distance = sqrt(pow(centroids.posX[j] - p_x, 2) + pow(centroids.posY[j] - p_y, 2));
-				if (distance < closest_c_dist || closest_c_id == -1) {
-					closest_c_dist = distance;
-					closest_c_id = centroids.ids[j];
-
-					points.centroidIds[i] = closest_c_id;
+						totCentroidsMoved++;
+					}
 				}
 			}
 
-		}
 
-		// update centroid positions
-		for (int i = 0; i < centroids.totalCentroids; i++) {
-			double tempX = 0;
-			double tempY = 0;
-
-			int currCentroidId = centroids.ids[i];
-			double currCentroidPoints = 0;
-			double newX = 0;
-			double newY = 0;
-			for (int j = 0; j < points.totalPoints; ++j) {
-
-				// skip points not assigned to current centroid
-				if (currCentroidId != points.centroidIds[j])
-					continue;
-
-				tempX += points.posX[j];
-				tempY += points.posY[j];
-				currCentroidPoints++;
+			// find SSE of current solution
+			for (int i = 0; i < totalPoints; i++)
+			{
+				centroidId = points.centroidIds[i];
+				deltaX = centroids.posX[centroidId] - points.posX[i];
+				deltaY = centroids.posY[centroidId] - points.posY[i];
+				currSse += sqrt(deltaX * deltaX + deltaY * deltaY);
 			}
 
-			if (currCentroidPoints > 0) {
-				newX = tempX / currCentroidPoints;
-				newY = tempY / currCentroidPoints;
-
-				// update coordinates if centroid moved more than threshold
-				if (pow(newX - centroids.posX[i], 2) > centroidThresholdSquared || pow(newY - centroids.posY[i], 2) > centroidThresholdSquared) {
-					centroids.posX[i] = newX;
-					centroids.posY[i] = newY;
-
-					centroidsMoved = true;
-				}
-
+			// check stop conditions: no centroids moved or max iterations reached
+			if (totCentroidsMoved == 0 || (stopAtMaxIterations && it == maxIterations)) {
+				solutions[run] = Solution{ currSse, centroids, points.centroidIds };
+				notConverged = false;
 			}
 
+			// reset solution results and update iteration counter
+			totCentroidsMoved = 0;
+			currSse = 0;
+			it++;
+
+			std::fill(centroidPositionsX.begin(), centroidPositionsX.end(), 0);
+			std::fill(centroidPositionsY.begin(), centroidPositionsY.end(), 0);
+			std::fill(centroidCounts.begin(), centroidCounts.end(), 0);
 		}
-
-		// check for convergence: no centroids moved or max iterations reached
-		if (!centroidsMoved || (stopAtMaxIterations && it == maxIterations)) {
-			break;
-		}
-
-		// increment iteration counter
-		it++;
+		// kmeans run end
 	}
-}
 
+	// find best solution
+	auto bestSolution = min_element(solutions.begin(), solutions.end(), [](const Solution& sol1, const Solution& sol2) {
+		return sol1.sse < sol2.sse;
+		});
 
-double Kmeans::calcSSE(Centroids& centroids, Points& points) const {
-	double sse = 0;
-	for (int i = 0; i < points.totalPoints; i++) {
-		sse += sqrt(pow(centroids.posX[points.centroidIds[i]] - points.posX[i], 2) +
-			pow(centroids.posY[points.centroidIds[i]] - points.posY[i], 2));
-	}
-	return sse;
+	*c = bestSolution->centroids;
+	p->centroidIds = bestSolution->clusterIds;
 }

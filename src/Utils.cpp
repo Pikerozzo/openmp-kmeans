@@ -19,7 +19,7 @@ string Utils::formatMicroseconds(chrono::microseconds duration)
 	return secondsStr + "'" + millisStr + "'" + microsStr;
 }
 
-vector<vector<double>> Utils::makeBlobs(int totalPoints, int totalCenters, double clusterStd, int xCoordMax, int yCoordMax, int seed) {
+vector<vector<double>> Utils::makeBlobs(int totalPoints, int totalCenters, double clusterStd, double xCoordMax, double yCoordMax, int seed) {
 	vector<vector<double>> points;
 	vector<vector<double>> centers;
 
